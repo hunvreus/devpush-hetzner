@@ -1,4 +1,4 @@
-# Devpush Hetzner Provisioning
+# /dev/push Hetzner provisioning
 
 Minimal Python (stdlib-only) helper to create a Hetzner Cloud server via the API. It sets up a non-root sudo user, disables root/password SSH, injects SSH keys, and runs a hardening script on first boot.
 
