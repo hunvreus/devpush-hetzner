@@ -18,8 +18,29 @@ This will:
 ## Requirements
 
 - Python 3.10+
-- Hetzner token via `HCLOUD_TOKEN`, `--token`, or interactive prompt (input hidden)
+- Hetzner API token (see [Getting a Token](#getting-a-token) below)
 - At least one SSH key: `--pubkey` or `--ssh-key-name`
+
+## Getting a Token
+
+1. **Create a Hetzner Cloud account** (if you don't have one):
+   - Sign up at https://www.hetzner.com/cloud
+
+2. **Create a project**:
+   - Log in to https://console.hetzner.cloud/
+   - Click "New Project" and give it a name (e.g., "devpush")
+
+3. **Generate an API token**:
+   - In your project, go to "Security" → "API Tokens"
+   - Click "Generate API Token"
+   - Give it a name (e.g., "devpush-provisioning")
+   - Select permissions: "Read & Write" (or at minimum: "Servers" read/write)
+   - Copy the token immediately (it's only shown once)
+
+4. **Use the token**:
+   - Set `HCLOUD_TOKEN` environment variable: `export HCLOUD_TOKEN=your-token`
+   - Or pass via `--token` flag: `python provision.py --token your-token`
+   - Or enter it when prompted (input is hidden)
 
 ## Options
 

@@ -3,6 +3,7 @@ import getpass
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -99,11 +100,13 @@ def build_cloud_init(user: str, pubkey: str | None, harden: bool) -> str:
         copy_root_key_cmd = (
             dedent(
                 f"""\
-                if [ -f /root/.ssh/authorized_keys ]; then
+                if [ -f /root/.ssh/authorized_keys ] && [ -s /root/.ssh/authorized_keys ]; then
                   install -d -m 700 -o {user} -g {user} /home/{user}/.ssh
                   cp /root/.ssh/authorized_keys /home/{user}/.ssh/authorized_keys
                   chown {user}:{user} /home/{user}/.ssh/authorized_keys
                   chmod 600 /home/{user}/.ssh/authorized_keys
+                else
+                  echo "Warning: /root/.ssh/authorized_keys not found or empty" >&2
                 fi
                 """
             )
@@ -112,7 +115,6 @@ def build_cloud_init(user: str, pubkey: str | None, harden: bool) -> str:
         )
 
     if harden:
-        ssh_pub_flag = f"--ssh-pub '{pubkey}'" if pubkey else ""
         harden_script = read_harden_script()
         if harden_script:
             write_files.append(
@@ -123,18 +125,12 @@ def build_cloud_init(user: str, pubkey: str | None, harden: bool) -> str:
                     "content": harden_script,
                 }
             )
-            runcmd.append(
-                " ".join(
-                    arg
-                    for arg in [
-                        "/usr/local/bin/harden.sh",
-                        "--ssh",
-                        f"--user {user}",
-                        ssh_pub_flag,
-                    ]
-                    if arg
-                )
-            )
+            harden_cmd_parts = ["/usr/local/bin/harden.sh", "--ssh", f"--user {user}"]
+            if pubkey:
+                harden_cmd_parts.append(f"--ssh-pub '{pubkey}'")
+            elif copy_root_key_cmd:
+                harden_cmd_parts.append("--ssh-pub \"$(cat /root/.ssh/authorized_keys 2>/dev/null || echo '')\"")
+            runcmd.append(" ".join(harden_cmd_parts))
         else:
             packages.extend(["ufw", "fail2ban", "unattended-upgrades"])
             write_files.append(
@@ -164,7 +160,7 @@ def build_cloud_init(user: str, pubkey: str | None, harden: bool) -> str:
                 ]
             )
 
-    if copy_root_key_cmd and copy_root_key_cmd not in runcmd:
+    if copy_root_key_cmd:
         runcmd.insert(0, copy_root_key_cmd)
 
     lines: list[str] = [
@@ -227,7 +223,35 @@ def api_request(method: str, path: str, token: str, payload: dict | None = None)
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"API {method} {path} failed: {exc.code} {body}") from exc
+        
+        if exc.code == 401:
+            try:
+                error_data = json.loads(body)
+                error_msg = error_data.get("error", {}).get("message", "Invalid token")
+            except (json.JSONDecodeError, KeyError):
+                error_msg = "Invalid token"
+            print(f"\nerror: Authentication failed - {error_msg}", file=sys.stderr)
+            print("\nPlease check:", file=sys.stderr)
+            print("  - The token is correct (copy it from https://console.hetzner.cloud/)", file=sys.stderr)
+            print("  - The token has the required permissions (Read & Write)", file=sys.stderr)
+            print("  - The token belongs to the correct project", file=sys.stderr)
+            sys.exit(1)
+        elif exc.code == 403:
+            print("\nerror: Permission denied (403)", file=sys.stderr)
+            print("Your token may not have sufficient permissions for this operation.", file=sys.stderr)
+            sys.exit(1)
+        elif exc.code == 404:
+            print("\nerror: Resource not found (404)", file=sys.stderr)
+            print(f"API path: {path}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            try:
+                error_data = json.loads(body)
+                error_msg = error_data.get("error", {}).get("message", body)
+            except (json.JSONDecodeError, KeyError):
+                error_msg = body
+            print(f"\nerror: API request failed ({exc.code}): {error_msg}", file=sys.stderr)
+            sys.exit(1)
 
 
 def create_server(args: argparse.Namespace, cloud_init: str, token: str):
@@ -262,7 +286,72 @@ def create_server(args: argparse.Namespace, cloud_init: str, token: str):
 
     response = api_request("POST", "/servers", token, payload)
     server = response.get("server") or {}
-    print(json.dumps(server, indent=2))
+    
+    server_id = server.get("id")
+    if not server_id:
+        print("error: server creation response missing ID", file=sys.stderr)
+        print(json.dumps(server, indent=2))
+        sys.exit(1)
+    
+    print(f"Server created: {server.get('name', 'unknown')} (ID: {server_id})")
+    print("Waiting for server to be ready...")
+    
+    max_wait = 300
+    start_time = time.time()
+    last_status = None
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > max_wait:
+            print(f"warning: server not ready after {max_wait}s, continuing anyway", file=sys.stderr)
+            break
+        
+        try:
+            status_response = api_request("GET", f"/servers/{server_id}", token)
+            status_server = status_response.get("server") or {}
+            status = status_server.get("status")
+            
+            if status == "running":
+                print("Server is running!")
+                break
+            elif status and status != last_status:
+                print(f"  Status: {status}...")
+                last_status = status
+            
+            time.sleep(3)
+        except Exception as exc:
+            print(f"warning: error checking status: {exc}", file=sys.stderr)
+            break
+    
+    final_response = api_request("GET", f"/servers/{server_id}", token)
+    final_server = final_response.get("server") or {}
+    
+    print("\n" + "=" * 60)
+    print("Server Details:")
+    print("=" * 60)
+    print(f"Name:     {final_server.get('name', 'N/A')}")
+    print(f"ID:       {final_server.get('id', 'N/A')}")
+    print(f"Status:   {final_server.get('status', 'N/A')}")
+    
+    public_net = final_server.get("public_net", {})
+    ipv4 = public_net.get("ipv4", {})
+    ip = ipv4.get("ip", "N/A")
+    print(f"IP:       {ip}")
+    
+    server_type = final_server.get("server_type", {})
+    print(f"Type:     {server_type.get('name', 'N/A')} ({server_type.get('cores', 'N/A')} cores, {server_type.get('memory', 'N/A')} MB RAM)")
+    
+    datacenter = final_server.get("datacenter", {})
+    location = datacenter.get("location", {})
+    print(f"Location: {location.get('name', 'N/A')} ({location.get('country', 'N/A')})")
+    
+    image = final_server.get("image", {})
+    print(f"Image:    {image.get('name', 'N/A')} ({image.get('os_flavor', 'N/A')})")
+    
+    print("=" * 60)
+    print(f"\nLogin with: ssh {args.user}@{ip}")
+    print("\nNote: Hardening script may take 2-3 minutes to complete after first boot.")
+    print("      The server will be fully ready once hardening finishes.")
+    print()
 
 
 def main():
